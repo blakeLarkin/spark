@@ -685,6 +685,39 @@ class ALS(@Since("1.4.0") override val uid: String) extends Estimator[ALSModel] 
     copyValues(model)
   }
 
+  def fitWithInit[ID](dataset: Dataset[_],
+    userInitFactors: Option[RDD[(ID, Array[Float])]] = None,
+    itemInitFactors: Option[RDD[(ID, Array[Float])]] = None): ALSModel = {
+    transformSchema(dataset.schema)
+    import dataset.sparkSession.implicits._
+
+    val r = if ($(ratingCol) != "") col($(ratingCol)).cast(FloatType) else lit(1.0f)
+    val ratings = dataset
+      .select(checkedCast(col($(userCol))), checkedCast(col($(itemCol))), r)
+      .rdd
+      .map { row =>
+        Rating(row.getInt(0), row.getInt(1), row.getFloat(2))
+      }
+
+    val instr = Instrumentation.create(this, ratings)
+    instr.logParams(rank, numUserBlocks, numItemBlocks, implicitPrefs, alpha, userCol,
+      itemCol, ratingCol, predictionCol, maxIter, regParam, nonnegative, checkpointInterval,
+      seed, intermediateStorageLevel, finalStorageLevel)
+
+    val (userFactors, itemFactors) = ALS.train(ratings, rank = $(rank),
+      numUserBlocks = $(numUserBlocks), numItemBlocks = $(numItemBlocks),
+      maxIter = $(maxIter), regParam = $(regParam), implicitPrefs = $(implicitPrefs),
+      alpha = $(alpha), nonnegative = $(nonnegative),
+      intermediateRDDStorageLevel = StorageLevel.fromString($(intermediateStorageLevel)),
+      finalRDDStorageLevel = StorageLevel.fromString($(finalStorageLevel)),
+      checkpointInterval = $(checkpointInterval), seed = $(seed))
+    val userDF = userFactors.toDF("id", "features")
+    val itemDF = itemFactors.toDF("id", "features")
+    val model = new ALSModel(uid, $(rank), userDF, itemDF).setParent(this)
+    instr.logSuccess(model)
+    copyValues(model)
+  }
+
   @Since("1.3.0")
   override def transformSchema(schema: StructType): StructType = {
     validateAndTransformSchema(schema)
@@ -912,7 +945,9 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
       intermediateRDDStorageLevel: StorageLevel = StorageLevel.MEMORY_AND_DISK,
       finalRDDStorageLevel: StorageLevel = StorageLevel.MEMORY_AND_DISK,
       checkpointInterval: Int = 10,
-      seed: Long = 0L)(
+      seed: Long = 0L,
+      userInitFactors: Option[RDD[(ID, Array[Float])]] = None,
+      itemInitFactors: Option[RDD[(ID, Array[Float])]] = None)(
       implicit ord: Ordering[ID]): (RDD[(ID, Array[Float])], RDD[(ID, Array[Float])]) = {
 
     require(!ratings.isEmpty(), s"No ratings available from $ratings")
@@ -946,8 +981,8 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
     // estimate the rating matrix.  The two matrices are stored in RDDs, partitioned by column such
     // that each factor column resides on the same Spark worker as its corresponding user or item.
     val seedGen = new XORShiftRandom(seed)
-    var userFactors = initialize(userInBlocks, rank, seedGen.nextLong())
-    var itemFactors = initialize(itemInBlocks, rank, seedGen.nextLong())
+    var userFactors = initialize(userInBlocks, rank, seedGen.nextLong(), userInitFactors)
+    var itemFactors = initialize(itemInBlocks, rank, seedGen.nextLong(), itemInitFactors)
 
     val solver = if (nonnegative) new NNLSSolver else new CholeskySolver
 
@@ -1219,24 +1254,40 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
    * @param rank rank
    * @return initialized factor blocks
    */
-  private def initialize[ID](
+  private def initialize[ID: ClassTag](
       inBlocks: RDD[(Int, InBlock[ID])],
       rank: Int,
-      seed: Long): RDD[(Int, FactorBlock)] = {
+      seed: Long,
+      initFactors: Option[RDD[(ID, Array[Float])]] = None
+  ): RDD[(Int, FactorBlock)] = {
     // Choose a unit vector uniformly at random from the unit sphere, but from the
     // "first quadrant" where all elements are nonnegative. This can be done by choosing
     // elements distributed as Normal(0,1) and taking the absolute value, and then normalizing.
     // This appears to create factorizations that have a slightly better reconstruction
     // (<1%) compared picking elements uniformly at random in [0,1].
-    inBlocks.map { case (srcBlockId, inBlock) =>
-      val random = new XORShiftRandom(byteswap64(seed ^ srcBlockId))
-      val factors = Array.fill(inBlock.srcIds.length) {
-        val factor = Array.fill(rank)(random.nextGaussian().toFloat)
-        val nrm = blas.snrm2(rank, factor, 1)
-        blas.sscal(rank, 1.0f / nrm, factor, 1)
-        factor
-      }
-      (srcBlockId, factors)
+    initFactors match {
+      case Some(initialFactors) =>
+        val srcIdToBlockId = inBlocks.flatMap {
+          case (srcBlockId, inBlock) => for (srcId <- inBlock.srcIds) yield (
+            srcId, srcBlockId
+          )
+        }
+        srcIdToBlockId.join(initialFactors).map {
+          case (srcId, (srcBlockId, factors)) => (srcBlockId, factors)
+            // (srcBlockId, (srcId, factors))
+            // verify that 'order' is correct as expected in the below case
+        }.groupByKey().mapValues{ case factors => factors.asInstanceOf[FactorBlock] }
+      case None =>
+        inBlocks.map { case (srcBlockId, inBlock) =>
+          val random = new XORShiftRandom(byteswap64(seed ^ srcBlockId))
+          val factors = Array.fill(inBlock.srcIds.length) {
+            val factor = Array.fill(rank)(random.nextGaussian().toFloat)
+            val nrm = blas.snrm2(rank, factor, 1)
+            blas.sscal(rank, 1.0f / nrm, factor, 1)
+            factor
+          }
+          (srcBlockId, factors)
+        }
     }
   }
 
